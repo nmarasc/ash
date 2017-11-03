@@ -1,13 +1,16 @@
 # utility procedures for use in ARM assembly language programs
-#   strlen: get the length of a null-terminated string
-#   strcmp: compare two strings lexicographically ("dictionary" order)
-#   print: write a null-terminated string to a given file descriptor
-#   println: print a null-terminated string followed by a newline
-#   newline: write a newline to a given file descriptor
-#   atoi: convert a null-terminated string of ASCII digits to a 32-bit number
-#   itoa: convert a 32-bit number into a null-terminated string of ASCII digits
-#   udiv10: unsigned division by 10, giving a quotient and remainder
-#   qr: generic division, giving a quotient and remainder
+#   strlen:    get the length of a null-terminated string
+#   strcmp:    compare two strings lexicographically ("dictionary" order)
+#   print:     write a null-terminated string to a given file descriptor
+#   println:   print a null-terminated string followed by a newline
+#   newline:   write a newline to a given file descriptor
+#   atoi:      convert a null-terminated string of ASCII digits to a 32-bit number
+#   itoa:      convert a 32-bit number into a null-terminated string of ASCII digits
+#   udiv10:    unsigned division by 10, giving a quotient and remainder
+#   qr:        generic division, giving a quotient and remainder
+#	  heap_init: initialize the free memory list in the heap
+#	  mem_alloc: allocate a block of memory of a given size
+#	  mem_free:  add an allocated block back to the free list
 
   .text
   .global strlen
@@ -19,7 +22,15 @@
   .global itoa
   .global udiv10
   .global qr
+	.global mem_alloc
+	.global mem_free
+	.global heap_init
+	.global heapbase
+	.global heapsize
 
+	.equ MEMFREE, 1024*1024*4	@ number of free bytes in heap
+	.equ HMASK, 0x07	@ mask for header alignment
+	.equ HSIZE, HMASK+1	@ header size
 
   .equ WRITE, 4
 
@@ -226,3 +237,224 @@ strcpy:
   cmp ip, #0              @ are we finished?
   bne strcpy
   mov pc, lr
+
+# procedure heap_init -- initialize the free memory list in the heap
+# parameters: none
+# returns nothing
+heap_init:
+	ldr r3, =heapsize
+	ldr ip, [r3]
+	cmp ip, #0		@ is the heap already initialized?
+	movne pc, lr		@ if so, do nothing
+	ldr ip, =MEMFREE
+	bic ip, ip, #HMASK	@ round down to multiple of 8
+	str ip, [r3]
+	mov r3, ip		@ heap size in bytes
+	ldr r0, =heapbase
+	ldr r0, [r0]		@ address of left sentinel
+# set up header sentinel
+	add r1, r0, #HSIZE	@ address of first "real" block
+	str r1, [r0]		@ put ptr to block in left sentinel
+	mov ip, #0
+	str ip, [r0, #4]	@ avail size in left sentinel (always zero)
+	sub r3, r3, #2*HSIZE	@ distance from block to right sentinel
+	add r2, r1, r3		@ address of right sentinel
+	sub r3, r3, #HSIZE	@ avail size in block
+	str r2, [r1]		@ ptr to right sentinel in block header
+	str r3, [r1, #4]	@ block size in block header
+	mov ip, #0
+	str ip, [r2]
+	str ip, [r2, #4]	@ put right sentinal pointer (null) ...
+				@ ... and size (zero) in sentinel header
+	mov pc, lr		@ return
+
+# procedure mem_alloc -- allocate a block of memory of a given size
+# parameters:
+#   r0 - the (unsigned) size of the block requested -- must be > 0
+# returns:
+#   r0 - the 32-bit address of the free space in the allocated memory block
+#        or null (0) if the allocation failed
+# Each block header consists of two words: the first is a pointer (next)
+# to the next block header, and the second is an integer (avail) of
+# free bytes in the block, not including the header.  The header is
+# stored as the first two words of the block.  All allocations are made
+# as multiples of HSIZE.
+# If the heap is uninitialized upon entry, heap_init will be called before
+# any allocations are made.
+mem_alloc:
+	cmp r0, #0
+	moveq pc, lr		@ return if zero bytes requested
+	ldr ip, =heapsize	@ address of heap size
+	ldr ip, [ip]		@ value of heap size
+	cmp ip, #0		@ if zero, must initialize
+	bne 0f
+	push {r0, lr}
+	bl heap_init		@ initialize the heap
+	pop {r0, lr}
+0:
+	add r0, r0, #HMASK	@ round up request to next header alignment
+	bic r0, r0, #HMASK
+	ldr r1, =heapbase	@ address of ptr to heap base
+	ldr r1, [r1]		@ prev ptr (initially the LH sentinel)
+	ldr r2, [r1]		@ curr ptr (the block to the right of prev)
+1:
+	ldr r3, [r2, #4]	@ curr avail size
+	cmp r3, #0		@ are we at the end of the free list?
+	moveq r0, #0		@ if so, return null (no blocks avail)
+	moveq pc, lr
+	subs r3, r3, r0		@ difference between request and avail
+	movlo r1, r2		@ if too small, prev gets curr, and ...
+	ldrlo r2, [r2]		@ ... curr gets next block in list ...
+	blo 1b			@ ... and continue the search
+# At this point, curr (r2) is  of sufficient size to meet the request.
+# If what's left (r3) is less than or equal to the header size, we just use
+# the current block
+	cmp r3, #HSIZE		@ if all we have left is a header ...
+	ldrls ip, [r2]		@ ... move curr next ptr to ...
+	strls ip, [r1]		@ ... prev next ptr ...
+	bls 9f			@ ... and clean up
+# If we get here, the block is not an exact match, so we carve up
+# the curr block appropriately -- no need to fix the prev header (r1)
+#   r0 - request size (rounded up to nearest allocation alignment)
+#   r2 - curr ptr
+#   r3 - size of block left over after allocation (including the header)
+	mov r1, r2		@ save ptr to curr block
+	add r2, r2, r3		@ ptr to beginning of new allocation block
+	sub ip, r3, #HSIZE	@ size of what's left in the curr block
+	str ip, [r1, #4]	@ store new avail size in curr
+	str r0, [r2, #4]	@ put allocation size in new block header
+# At this point, r2 is the address of the header of the block to allocate.
+# The size of the block has already been set, so we make the next field
+# of the block header point to itself and return the address
+# of the data in r0
+9:
+	str r2, [r2]		@ make block header point to itself!
+	add r0, r2, #HSIZE	@ move past the header
+	mov pc, lr		@ and return
+
+# procedure mem_free - add an allocated block back to the free list
+# parameters:
+#   r0 - address of allocated memory returned by previous call to mem_alloc
+# returns:
+#   r0 - 0 if successful, -1 if not
+mem_free:
+	push {r4, r5, lr}
+	sub r1, r0, #HSIZE	@ addr. of block to be freed, including hdr
+	ands ip, r1, #HMASK	@ lower three bits must be zero
+	bne 9f			@ error exit
+# Set r0 to the LH sentinel block and r2 to the RH sentinel block
+	ldr r0, =heapbase
+	ldr r0, [r0]		@ r0 points to the LH sentinel block
+	ldr ip, =heapsize
+	ldr ip, [ip]		@ the size of the heap
+	sub ip, ip, #HSIZE	@ adjust for the RH sentinel block header
+	add r2, r0, ip		@ r2 points to the RH sentinel block
+# First see if r1 is strictly within the heap area
+	cmp r0, r1		@ LH sentinel address must be lower than r1
+	bhs 9f
+	cmp r1, r2		@ r1 must be lower than RH sentinel address
+	bhs 9f			@ error exit
+# Now do some sanity checks on the r1 block
+	ldr ip, [r1]		@ ip must be r1
+	cmp ip, r1
+	bne 9f			@ error exit
+	ldr r4, [r1, #4]	@ get the size of the block to free
+	ands ip, r4, #HMASK	@ the size must be a multiple of 8
+	bne 9f			@ error exit if not
+	cmp r4, #0		@ and must be nonzero
+	beq 9f			@ error exit otherwise
+# At this point, r1 points to a block whose address is between the
+# LH sentinel and the RH sentinel, so we chase down the free list
+# starting at the LH sentinel to see where this block should be placed.
+# Note that r0 initially points to the LH sentinel block (prev) and
+# that r0 is less than r1.
+# We stop our search when r2, the address of the 'curr' block,
+# is greater than r1.  Since r1 is known to be less than the address
+# of the RH sentinel block, which is at the end of the linked list,
+# this search is guaranteed to succeed.
+	ldr r2, [r0]		@ r2 = the next unallocated block (curr)
+1:	cmp r1, r2		@ is r1 less than curr?
+	movhs r0, r2		@ if not, ...
+	ldrhs r2, [r0]		@ ... move to next prev/curr pair ...
+	bhs 1b			@ ... and repeat the search
+# At this point, r2 (curr) is the first block whose address is greater than r1.
+# Now verify that r0 (prev) is less than r1.
+	cmp r0, r1
+	bhs 9f			@ error if not
+# Now r1 is pinned between r0 (prev) and r2 (curr).
+	ldr r3, [r0, #4]	@ the number of free bytes in block r0
+	ldr r5, [r2, #4]	@ the number of free bytes in block r2
+# Note that the number of about-to-be-free bytes in block r1 is
+# already in r4.
+# For a block rx already on the free list, we use the notation rx.free
+# to be the number of free bytes in the block.  This value is in [rx, #4].
+# Similarly, we use the notation rx.next to be the pointer to the block
+# following rx in the free list.  This value is in [rx].
+# So far, we have
+#   r3 contains r0.free
+#   r4 contains r1.free
+#   r5 contains r2.free
+#   r0.next is r2
+#
+# In order for the r1 block to be between blocks r0 and r2,
+# the following inequalities must hold -- otherwise there would be an overlap
+#    (1) r0 + 8 + r0.free <= r1
+#    (2) r1 + 8 + r1.free <= r2
+# If inequality (2) is an equality, it may be possible to coalesce r1 and r2.
+# If inequality (1) is an equality, it may be possible to coalesce r0 and r1.
+# We check inequality (2) first:
+	add ip, r4, #8		@ 8 + r1.free
+	add ip, ip, r1		@ r1 + 8 + r1.free
+	cmp ip, r2		@ should be <=
+	bhi 9f			@ if not, return error
+# Don't coalesce r1 and r2 if (2) is strict or if r2 is
+# the RH sentinel block.
+	bne 2f			@ don't coalesce r1 and r2 if (2) is strict
+	cmp r5, #0		@ is r2 the RH sentinel?
+	beq 2f			@ if so, don't coalesce
+# Coalesce blocks r1 and r2
+	add r4, r4, r5
+	add r4, r4, #HSIZE	@ the new free size for r1
+	str r4, [r1, #4]	@ update r1.free
+	ldr r2, [r2]		@ r2 = r2.next (original r2 is swallowed up)
+# No coalesce, so we simply link r1.next to r2
+2:
+	str r2, [r1]		@ r1.next = r2
+# We check inequality (1) next:
+3:
+	add ip, r3, #8		@ 8 + r0.free
+	add ip, ip, r0		@ r0 + 8 + r0.free
+	cmp ip, r1		@ should be <=
+	bhi 9f			@ if not, return error
+# Don't coalesce r0 and r1 if (1) is strict or if r0 is
+# the LH sentinel block.
+	bne 4f			@ don't coalesce r0 and r1 if (1) is strict
+	cmp r3, #0		@ is r0 the LH sentinel?
+	beq 4f			@ if so, don't coalesce
+# Coalesce blocks r0 and r1
+	add r3, r3, r4
+	add r3, r3, #HSIZE	@ the new free size for r0
+	str r3, [r0, #4]	@ update r0.free
+	ldr r1, [r1]		@ r1 = r1.next (original r1 is swallowed up)
+# No coalesce, so we simply link r0.next to r1
+4:
+	str r1, [r0]		@ r0.next = r1
+# Finish up
+5:
+	mov r0, #0		@ success
+	pop {r4, r5, pc}
+
+# Error exit -- returns -1
+9:	mvn r0, #0
+	pop {r4, r5, pc}
+
+
+	.data
+
+heapsize: .word 0		@ size of the heap (0 if uninitialized)
+heapbase: .word base		@ location of free memory in bss
+
+	.bss
+
+	.align 3		@ align on a multiple of 8
+	.lcomm base, MEMFREE	@ heap storage
